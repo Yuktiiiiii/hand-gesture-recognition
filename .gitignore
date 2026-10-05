@@ -1,0 +1,26 @@
+# data (download with scripts/download_data.py — never commit the 2 GB dataset)
+data/*
+!data/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# os / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# notebook download bundle
+experiment_outputs.zip
+
+# Checkpoints are committed (all < 100 MB) so the demo works after cloning.
+# Uncomment to keep them out of git instead:
+# checkpoints/
