@@ -1,8 +1,6 @@
 # Static Hand Gesture Recognition Using Deep Learning
 ### A Comparative Study of MLP, CNN and Transfer Learning — ICT-4442 Deep Learning Mini Project
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_GITHUB_USERNAME/hand-gesture-recognition/blob/main/notebooks/run_all_experiments.ipynb)
-
 School of Computer Engineering, Manipal Institute of Technology (MAHE)
 
 | Member | Reg. No. | Model |
@@ -23,9 +21,6 @@ drives a real-time webcam demo.
 Test set = two subjects (08, 09) **never seen during training or model selection**.
 Latency = mean per-image CPU inference, batch 1, single thread.
 
-<!-- RESULTS_START -->
-_Run `python scripts/run_all.py` (or the Colab notebook). `src/compare.py` fills this table and the plots in automatically._
-<!-- RESULTS_END -->
 
 Each run's folder in `results/<run>/` has the confusion matrix, training curves, per-class
 classification report, and a JSON file with every metric.
@@ -106,8 +101,6 @@ python -m src.train --model resnet18
 python -m src.compare                # table + plots + README update
 ```
 
-No GPU? Open the **Colab notebook** (`notebooks/run_all_experiments.ipynb`). It runs everything
-on a free T4 in about 30–45 minutes and gives you a zip of `results/` and `checkpoints/` to commit.
 
 Useful flags: `--epochs`, `--batch-size`, `--lr`, `--img-size`, `--split {subject,random}`,
 `--no-augment`, `--freeze-epochs`, `--no-pretrained`, `--device {auto,cuda,cpu,mps}`.
