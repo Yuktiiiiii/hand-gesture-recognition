@@ -1,284 +1,167 @@
-"""Data pipeline for LeapGestRecog.
+"""Dataset acquisition and preprocessing (Section 2 of the report).
 
-Responsibilities
-----------------
-* Locate the dataset root (the Kaggle archive contains a duplicated nested
-  copy, so we pick exactly one root and ignore the other).
-* Build a sample list of (path, label, subject).
-* Split by **subject** (default) so that no person appears in more than one
-  split. LeapGestRecog frames are consecutive video frames, so a random
-  split leaks near-identical images between train and test and inflates
-  accuracy to ~100%. The random split is still available for comparison.
-* Cache all images as a resized uint8 array (``data/cache/*.npz``) so that
-  every model / run reads the exact same pixels quickly.
-* Provide identical augmentation + normalisation for every model.
+Pipeline:
+ 1. Locate / download LeapGestRecog
+ 2. Image integrity and duplicate checking (MD5 hash)
+ 3. Metadata table: path, subject ID, gesture label
+ 4. Subject-wise train / val / test split
+ 5. Resize to 128x128
+ 6. Encode labels 0..9
+ 7. Normalise to [0, 1] (done on the fly in to_tensor / model-specific prep)
+ 8. Augmentation on training images only (see augment.py)
 """
-from __future__ import annotations
-
+import argparse
 import hashlib
+import math
 import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from torchvision.transforms import v2 as T
+from tqdm import tqdm
 
-SUBJECT_DIR_RE = re.compile(r"^\d{2}$")
-GESTURE_DIR_RE = re.compile(r"^(\d{2})_(.+)$")
-IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp"}
+from . import config as C
 
-# Normalisation applied to every model: grayscale in [0,1] -> [-1,1]
-MEAN, STD = 0.5, 0.5
+FRAME_RE = re.compile(r"frame_(\d{2})_(\d{2})_(\d{4})\.png$")
 
 
-@dataclass
-class Sample:
-    path: str
-    label: int
-    subject: str
+def find_dataset_root(path: str | None = None) -> Path:
+    """Return the folder holding the subject sub-folders 00..09."""
+    if path is None:
+        path = os.environ.get("LEAPGEST_DIR")
+    if path is None:
+        import kagglehub
+        path = kagglehub.dataset_download("gti-upm/leapgestrecog")
+    path = Path(path)
+    for cand in [path, path / "leapGestRecog", path / "leapGestRecog" / "leapGestRecog"]:
+        if (cand / "00").is_dir():
+            return cand
+    raise FileNotFoundError(f"Could not find LeapGestRecog subject folders under {path}")
 
 
-# ----------------------------------------------------------------------------
-# Discovery
-# ----------------------------------------------------------------------------
-def _is_leap_root(p: Path) -> bool:
-    try:
-        subjects = [c for c in p.iterdir() if c.is_dir() and SUBJECT_DIR_RE.match(c.name)]
-    except (PermissionError, FileNotFoundError):
-        return False
-    if len(subjects) < 2:
-        return False
-    first = sorted(subjects)[0]
-    return any(g.is_dir() and GESTURE_DIR_RE.match(g.name) for g in first.iterdir())
-
-
-def find_dataset_root(data_dir: str | os.PathLike, max_depth: int = 4) -> Path:
-    """Return the shallowest directory under ``data_dir`` that looks like
-    ``<root>/<subject 00..09>/<NN_gesture>/*.png``."""
-    data_dir = Path(data_dir)
-    if not data_dir.exists():
-        raise FileNotFoundError(
-            f"Data directory '{data_dir}' does not exist. Run `python scripts/download_data.py` "
-            "or pass --data-dir pointing at the extracted LeapGestRecog folder."
-        )
-    base_depth = len(data_dir.resolve().parts)
-    for dirpath, dirnames, _ in sorted(os.walk(data_dir), key=lambda t: (len(Path(t[0]).parts), t[0])):
-        p = Path(dirpath)
-        if len(p.resolve().parts) - base_depth > max_depth:
-            dirnames[:] = []
+def build_metadata(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Scan the dataset, check integrity and duplicates, and return (metadata, removed)."""
+    rows, removed = [], []
+    seen_hashes: dict[str, str] = {}
+    files = sorted(root.rglob("*.png"))
+    for f in tqdm(files, desc="Scanning images"):
+        m = FRAME_RE.search(f.name)
+        if m is None:
+            removed.append({"path": str(f), "reason": "unrecognised filename"})
             continue
-        if _is_leap_root(p):
-            return p
-    raise FileNotFoundError(f"Could not find LeapGestRecog structure under '{data_dir}'.")
-
-
-def gesture_display_name(folder: str) -> str:
-    m = GESTURE_DIR_RE.match(folder)
-    return m.group(2) if m else folder
-
-
-def build_samples(root: Path) -> tuple[list[Sample], list[str]]:
-    """Scan the LeapGestRecog tree. Returns samples and ordered class names."""
-    subjects = sorted(c for c in root.iterdir() if c.is_dir() and SUBJECT_DIR_RE.match(c.name))
-    gesture_folders = sorted(
-        {g.name for s in subjects for g in s.iterdir() if g.is_dir() and GESTURE_DIR_RE.match(g.name)}
-    )
-    class_names = [gesture_display_name(g) for g in gesture_folders]
-    folder_to_idx = {g: i for i, g in enumerate(gesture_folders)}
-    samples: list[Sample] = []
-    for s in subjects:
-        for g in sorted(s.iterdir()):
-            if not (g.is_dir() and g.name in folder_to_idx):
-                continue
-            for f in sorted(g.iterdir()):
-                if f.suffix.lower() in IMG_EXTS:
-                    samples.append(Sample(str(f), folder_to_idx[g.name], s.name))
-    if not samples:
-        raise RuntimeError(f"No images found under {root}")
-    return samples, class_names
-
-
-def build_flat_samples(root: Path, class_names: list[str]) -> list[Sample]:
-    """Samples from a flat ``<root>/<class_name>/*.png`` folder (e.g. the
-    self-recorded webcam set). Folder names must match ``class_names``."""
-    samples = []
-    name_to_idx = {n: i for i, n in enumerate(class_names)}
-    for d in sorted(Path(root).iterdir()):
-        if not d.is_dir():
+        subject, gesture_idx = int(m.group(1)), int(m.group(2))
+        gesture_folder = f.parent.name
+        if gesture_folder not in C.GESTURES or C.GESTURES.index(gesture_folder) != gesture_idx - 1:
+            removed.append({"path": str(f), "reason": "label/folder mismatch"})
             continue
-        name = gesture_display_name(d.name)
-        if name not in name_to_idx:
-            print(f"[warn] skipping folder '{d.name}': not one of {class_names}")
+        data = f.read_bytes()
+        digest = hashlib.md5(data).hexdigest()
+        if digest in seen_hashes:
+            removed.append({"path": str(f), "reason": f"duplicate of {seen_hashes[digest]}"})
             continue
-        for f in sorted(d.iterdir()):
-            if f.suffix.lower() in IMG_EXTS:
-                samples.append(Sample(str(f), name_to_idx[name], "webcam"))
-    return samples
+        try:
+            with Image.open(f) as im:
+                im.verify()
+        except Exception as e:  # corrupted / unreadable
+            removed.append({"path": str(f), "reason": f"unreadable: {e}"})
+            continue
+        seen_hashes[digest] = str(f)
+        rows.append({
+            "path": str(f),
+            "subject": subject,
+            "gesture": gesture_folder,
+            "label": gesture_idx - 1,
+            "md5": digest,
+        })
+    meta = pd.DataFrame(rows).sort_values(["subject", "label", "path"]).reset_index(drop=True)
+    meta["split"] = np.select(
+        [meta.subject.isin(C.TRAIN_SUBJECTS), meta.subject.isin(C.VAL_SUBJECTS),
+         meta.subject.isin(C.TEST_SUBJECTS)],
+        ["train", "val", "test"], default="unused")
+    return meta, pd.DataFrame(removed, columns=["path", "reason"])
 
 
-# ----------------------------------------------------------------------------
-# Splitting
-# ----------------------------------------------------------------------------
-def split_samples(
-    samples: list[Sample],
-    mode: str = "subject",
-    val_subjects: tuple[str, ...] = ("06", "07"),
-    test_subjects: tuple[str, ...] = ("08", "09"),
-    val_frac: float = 0.15,
-    test_frac: float = 0.15,
-    seed: int = 42,
-) -> dict[str, list[int]]:
-    """Return indices for train / val / test."""
-    idx = np.arange(len(samples))
-    if mode == "subject":
-        subj = np.array([s.subject for s in samples])
-        test = idx[np.isin(subj, test_subjects)]
-        val = idx[np.isin(subj, val_subjects)]
-        train = idx[~np.isin(subj, list(val_subjects) + list(test_subjects))]
-        if len(test) == 0 or len(val) == 0:
-            raise ValueError(
-                f"Subject split produced an empty split. Subjects present: {sorted(set(subj))}"
-            )
-    elif mode == "random":
-        from sklearn.model_selection import train_test_split
-
-        labels = np.array([s.label for s in samples])
-        trval, test = train_test_split(idx, test_size=test_frac, stratify=labels, random_state=seed)
-        train, val = train_test_split(
-            trval, test_size=val_frac / (1 - test_frac), stratify=labels[trval], random_state=seed
-        )
-    else:
-        raise ValueError(f"Unknown split mode '{mode}'")
-    return {"train": sorted(train.tolist()), "val": sorted(val.tolist()), "test": sorted(test.tolist())}
-
-
-# ----------------------------------------------------------------------------
-# Caching
-# ----------------------------------------------------------------------------
-def load_image(path: str, img_size: int) -> np.ndarray:
+def load_and_resize(path: str, size: int = C.IMG_SIZE) -> np.ndarray:
     with Image.open(path) as im:
-        im = im.convert("L").resize((img_size, img_size), Image.BILINEAR)
+        im = im.convert("L").resize((size, size), Image.BILINEAR)
         return np.asarray(im, dtype=np.uint8)
 
 
-def load_or_build_cache(samples: list[Sample], img_size: int, cache_dir: str | os.PathLike) -> np.ndarray:
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    key = hashlib.md5(("|".join(s.path for s in samples) + f"@{img_size}").encode()).hexdigest()[:12]
-    f = cache_dir / f"images_{img_size}_{len(samples)}_{key}.npy"
-    if f.exists():
-        arr = np.load(f)
-        if arr.shape == (len(samples), img_size, img_size):
-            return arr
-    print(f"[data] building image cache ({len(samples)} images @ {img_size}px) -> {f}")
-    from concurrent.futures import ThreadPoolExecutor
+def prepare(dataset_dir: str | None = None, force: bool = False) -> None:
+    """Run the full preprocessing pipeline once and cache the result as uint8 arrays."""
+    if C.CACHE_FILE.exists() and not force:
+        print(f"Cache already exists: {C.CACHE_FILE}")
+        return
+    root = find_dataset_root(dataset_dir)
+    print(f"Dataset root: {root}")
+    meta, removed = build_metadata(root)
+    meta.to_csv(C.METADATA_FILE, index=False)
+    removed.to_csv(C.REMOVED_FILE, index=False)
+    print(f"Kept {len(meta)} images, removed {len(removed)} "
+          f"({removed.reason.str.split(' ').str[0].value_counts().to_dict()})")
 
-    try:
-        from tqdm import tqdm
-    except ImportError:  # pragma: no cover
-        tqdm = lambda x, **k: x  # noqa: E731
-    arr = np.empty((len(samples), img_size, img_size), dtype=np.uint8)
-    with ThreadPoolExecutor(max_workers=min(8, (os.cpu_count() or 2) * 2)) as ex:
-        for i, im in enumerate(tqdm(ex.map(lambda s: load_image(s.path, img_size), samples), total=len(samples))):
-            arr[i] = im
-    np.save(f, arr)
-    return arr
+    missing = set(range(C.NUM_CLASSES)) - set(meta.label)
+    assert not missing, f"Missing gesture classes: {missing}"
 
+    counts = meta.pivot_table(index="subject", columns="gesture", values="path", aggfunc="count")
+    counts.to_csv(C.RESULTS_DIR / "class_subject_counts.csv")
+    print("Images per subject x gesture:\n", counts)
 
-# ----------------------------------------------------------------------------
-# Transforms / Dataset
-# ----------------------------------------------------------------------------
-def build_transforms(train: bool, augment: bool = True):
-    """Identical transforms for every model. Input: uint8 tensor (1,H,W)."""
-    ops = []
-    if train and augment:
-        ops += [
-            T.RandomAffine(degrees=15, translate=(0.10, 0.10), scale=(0.9, 1.1)),
-            T.RandomHorizontalFlip(p=0.5),  # left vs right hand
-            T.ColorJitter(brightness=0.3, contrast=0.3),
-        ]
-    ops += [T.ToDtype(torch.float32, scale=True), T.Normalize([MEAN], [STD])]
-    return T.Compose(ops)
+    images = np.stack([load_and_resize(p) for p in tqdm(meta.path, desc="Resizing to 128x128")])
+    np.savez_compressed(
+        C.CACHE_FILE,
+        images=images,
+        labels=meta.label.to_numpy(np.int64),
+        subjects=meta.subject.to_numpy(np.int64),
+        split=meta.split.to_numpy(),
+    )
+    print(f"Saved cache {C.CACHE_FILE} with images {images.shape}")
 
 
-class GestureArrayDataset(Dataset):
-    def __init__(self, images: np.ndarray, labels: np.ndarray, transform=None):
-        self.images = images
-        self.labels = labels
-        self.transform = transform
-
-    def __len__(self) -> int:
-        return len(self.labels)
-
-    def __getitem__(self, i):
-        x = torch.from_numpy(np.ascontiguousarray(self.images[i]))[None]  # (1,H,W) uint8
-        if self.transform is not None:
-            x = self.transform(x)
-        return x, int(self.labels[i])
+def load_splits() -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Return {'train': (X, y), 'val': ..., 'test': ...} with X as uint8 (N, 128, 128)."""
+    if not C.CACHE_FILE.exists():
+        prepare()
+    d = np.load(C.CACHE_FILE, allow_pickle=True)
+    out = {}
+    for s in ("train", "val", "test"):
+        m = d["split"] == s
+        out[s] = (d["images"][m], d["labels"][m])
+    return out
 
 
-def preprocess_gray(img_gray: np.ndarray, img_size: int) -> torch.Tensor:
-    """Single grayscale image (H,W uint8) -> normalised tensor (1,1,S,S).
-    Used by the webcam demo so inference matches training preprocessing."""
-    im = Image.fromarray(img_gray).resize((img_size, img_size), Image.BILINEAR)
-    x = torch.from_numpy(np.asarray(im, dtype=np.float32) / 255.0)[None, None]
-    return (x - MEAN) / STD
+class TensorBatches:
+    """Minimal in-memory batch iterator; data lives on the target device as uint8."""
+
+    def __init__(self, X: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool,
+                 device: torch.device, seed: int = C.SEED):
+        self.X = torch.from_numpy(X).to(device)
+        self.y = torch.from_numpy(y).to(device)
+        self.bs, self.shuffle = batch_size, shuffle
+        self.gen = torch.Generator().manual_seed(seed)
+
+    def __len__(self):
+        return math.ceil(len(self.y) / self.bs)
+
+    def __iter__(self):
+        n = len(self.y)
+        idx = torch.randperm(n, generator=self.gen) if self.shuffle else torch.arange(n)
+        idx = idx.to(self.X.device)
+        for i in range(0, n, self.bs):
+            b = idx[i:i + self.bs]
+            xb = self.X[b]
+            if xb.dtype == torch.uint8:
+                # uint8 image -> float in [0, 1], add channel dim: (B, 1, H, W)
+                xb = xb.unsqueeze(1).float().div_(255.0)
+            yield xb, self.y[b]
 
 
-@dataclass
-class DataBundle:
-    loaders: dict[str, DataLoader]
-    class_names: list[str]
-    split_sizes: dict[str, int]
-    root: str
-
-
-def make_dataloaders(
-    data_dir: str,
-    img_size: int = 128,
-    batch_size: int = 64,
-    split: str = "subject",
-    augment: bool = True,
-    num_workers: int = 2,
-    seed: int = 42,
-    cache_dir: str = "data/cache",
-    val_subjects=("06", "07"),
-    test_subjects=("08", "09"),
-) -> DataBundle:
-    root = find_dataset_root(data_dir)
-    samples, class_names = build_samples(root)
-    images = load_or_build_cache(samples, img_size, cache_dir)
-    labels = np.array([s.label for s in samples], dtype=np.int64)
-    idx = split_samples(samples, split, tuple(val_subjects), tuple(test_subjects), seed=seed)
-
-    g = torch.Generator().manual_seed(seed)
-    loaders = {}
-    for name, ids in idx.items():
-        ds = GestureArrayDataset(images[ids], labels[ids], build_transforms(name == "train", augment))
-        loaders[name] = DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=(name == "train"),
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False,
-            generator=g if name == "train" else None,
-            persistent_workers=num_workers > 0,
-        )
-    sizes = {k: len(v) for k, v in idx.items()}
-    print(f"[data] root={root}  classes={class_names}  split={split} sizes={sizes}")
-    return DataBundle(loaders, class_names, sizes, str(root))
-
-
-def make_flat_loader(folder: str, class_names: list[str], img_size: int, batch_size: int = 64) -> DataLoader:
-    samples = build_flat_samples(Path(folder), class_names)
-    if not samples:
-        raise RuntimeError(f"No images found in {folder}")
-    images = np.stack([load_image(s.path, img_size) for s in samples])
-    labels = np.array([s.label for s in samples], dtype=np.int64)
-    ds = GestureArrayDataset(images, labels, build_transforms(train=False))
-    return DataLoader(ds, batch_size=batch_size, shuffle=False)
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Run LeapGestRecog preprocessing")
+    ap.add_argument("--dataset-dir", default=None, help="Path to the extracted dataset")
+    ap.add_argument("--force", action="store_true")
+    args = ap.parse_args()
+    prepare(args.dataset_dir, args.force)
