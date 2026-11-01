@@ -10,3 +10,4 @@ tqdm>=4.65
 opencv-python>=4.8
 kagglehub>=0.2
 pytest>=7.4
+certifi>=2023.7.22
